@@ -34,13 +34,11 @@ type Beans struct {
 
 type Grinder struct {
 	gramsPerSecond int
-	mu             sync.Mutex
 }
 
 type Brewer struct {
 	// assume we have unlimited water, but we can only run a certain amount of water per second into our brewer + beans
 	ouncesWaterPerSecond int
-	mu                   sync.Mutex
 }
 
 type CoffeeSize int
@@ -187,9 +185,6 @@ func (cs *CoffeeShop) StartBaristas(numBaristas int) {
 func (g *Grinder) Grind(beans Beans) Beans {
 	// how long should it take this function to complete?
 	// i.e. time.Sleep(XXX)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	grindTime := beans.weightGrams / g.gramsPerSecond
 	time.Sleep(time.Duration(grindTime) * time.Second)
 	return Beans{
@@ -203,11 +198,8 @@ func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
 	// assume we need 6 ounces of water for every 12 grams of beans
 	// how long should it take this function to complete?
 	// i.e. time.Sleep(YYY)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	brewTime := (beans.weightGrams / 2) * 1 / b.ouncesWaterPerSecond
-	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v\n", time.Duration(brewTime)*time.Second, orderID, size)))
+	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v with %v beans\n", time.Duration(brewTime)*time.Second, orderID, size, beans.beanType)))
 	time.Sleep(time.Duration(brewTime) * time.Second)
 	return Coffee{
 		orderID,
