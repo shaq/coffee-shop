@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sync"
 	"time"
 )
@@ -67,21 +69,24 @@ type CoffeeShop struct {
 	grinders                 []*Grinder
 	brewers                  []*Brewer
 	totalAmountUngroundBeans int
+	beansMutex               sync.Mutex
 	orders                   chan Order
 	done                     chan Coffee
 	failedOrders             chan Order
+	refills                  chan struct{}
 }
 
-func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer, numCustomers int) *CoffeeShop {
+func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer, numCustomers int, ungroundBeans int) *CoffeeShop {
 	cs := &CoffeeShop{
 		grindersPool:             make(chan *Grinder, len(grinders)),
 		brewersPool:              make(chan *Brewer, len(brewers)),
 		grinders:                 grinders,
 		brewers:                  brewers,
-		totalAmountUngroundBeans: 100, // default amount of coffee beans
+		totalAmountUngroundBeans: ungroundBeans,
 		orders:                   make(chan Order, numCustomers),
 		done:                     make(chan Coffee, numCustomers),
 		failedOrders:             make(chan Order, numCustomers),
+		refills:                  make(chan struct{}, 1),
 	}
 
 	for _, g := range grinders {
@@ -97,6 +102,15 @@ func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer, numCustomers int) *Co
 
 func (cs *CoffeeShop) MakeCoffeeOrder(order Order) {
 	cs.orders <- order
+}
+
+func (cs *CoffeeShop) RefillBeans(amount int) {
+	cs.beansMutex.Lock()
+	defer cs.beansMutex.Unlock()
+
+	cs.totalAmountUngroundBeans += amount
+	fmt.Printf("Beans have been refilled! Total amount now: %v\n", cs.totalAmountUngroundBeans)
+	cs.refills <- struct{}{} // signal that refills have occured
 }
 
 type Coffee struct {
@@ -130,30 +144,52 @@ func (b *Barista) ProcessOrders() {
 
 func (b *Barista) processOrder(order Order, retryCount int) error {
 	const maxRetries = 5
-	const initDelay = 3 * time.Second
+	//const initDelay = 3 * time.Second
+	const initDelay = 500 * time.Millisecond
 	delay := time.Duration(math.Pow(2, float64(retryCount))) * initDelay // exponential backoff strategy for timeouts
 
 	ouncesOfCoffeeWanted := coffeeSizesToOunces[order.size]
 	gramsNeeded := ouncesOfCoffeeWanted * order.coffeeStrength
 	ungroundBeans := Beans{weightGrams: gramsNeeded, state: Unground}
 
-	var groundBeans Beans
-	var grinder *Grinder
-	select {
-	case grinder = <-b.coffeeShop.grindersPool:
-	case <-time.After(delay):
+	// first check if there are enough beans to process the order
+	if !b.coffeeShop.UseBeans(gramsNeeded) {
+		// retry if not
 		if retryCount < maxRetries {
-			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			fmt.Printf(Format(BLUE, fmt.Sprintf("Beans: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			time.Sleep(delay)
 			return b.processOrder(order, retryCount+1)
 		} else {
+			// if retries fail, put order on failedOrders channel
+			b.coffeeShop.failedOrders <- order
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts", b.ID, order.ID, retryCount)))
 		}
 	}
-	retryCount = 0 // reset retryCount for Brewer
 
-	groundBeans = grinder.Grind(ungroundBeans)
-	b.coffeeShop.grindersPool <- grinder
-	groundBeans.state = Ground
+	var groundBeans Beans
+	var err error
+	var grinder *Grinder
+	select {
+	case grinder = <-b.coffeeShop.grindersPool:
+		if groundBeans, err = grinder.Grind(b.coffeeShop, ungroundBeans); err != nil {
+			b.coffeeShop.grindersPool <- grinder // return grinder to prevent resource starvation on fail
+			return fmt.Errorf(Format(RED, fmt.Sprintf("Problem grinding beans: %v %v", err, order.ID)))
+		}
+		b.coffeeShop.grindersPool <- grinder
+		groundBeans.state = Ground
+	case <-time.After(delay):
+		if retryCount < maxRetries {
+			fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			return b.processOrder(order, retryCount+1)
+		} else {
+			b.coffeeShop.failedOrders <- order
+			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts", b.ID, order.ID, retryCount)))
+		}
+	case <-b.coffeeShop.refills:
+		// if beans are refilled, try the order again and reset retries
+		return b.processOrder(order, 0)
+	}
+	retryCount = 0 // reset retryCount for brewing
 
 	var coffee Coffee
 	var brewer *Brewer
@@ -161,9 +197,10 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 	case brewer = <-b.coffeeShop.brewersPool:
 	case <-time.After(delay):
 		if retryCount < maxRetries {
-			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			fmt.Printf(Format(BLUE, fmt.Sprintf("Brew: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			return b.processOrder(order, retryCount+1)
 		} else {
+			b.coffeeShop.failedOrders <- order
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts", b.ID, order.ID, retryCount)))
 		}
 	}
@@ -182,16 +219,31 @@ func (cs *CoffeeShop) StartBaristas(numBaristas int) {
 	}
 }
 
-func (g *Grinder) Grind(beans Beans) Beans {
+func (cs *CoffeeShop) UseBeans(amount int) bool {
+	cs.beansMutex.Lock()
+	defer cs.beansMutex.Unlock()
+
+	if cs.totalAmountUngroundBeans < amount {
+		return false
+	}
+
+	cs.totalAmountUngroundBeans -= amount
+	return true
+}
+
+func (g *Grinder) Grind(cs *CoffeeShop, beans Beans) (Beans, error) {
 	// how long should it take this function to complete?
 	// i.e. time.Sleep(XXX)
+	if !cs.UseBeans(beans.weightGrams) {
+		return Beans{}, fmt.Errorf(Format(RED, "Not enough beans available to make coffee order"))
+	}
 	grindTime := beans.weightGrams / g.gramsPerSecond
 	time.Sleep(time.Duration(grindTime) * time.Second)
 	return Beans{
 		weightGrams: beans.weightGrams,
 		state:       Ground,
 		beanType:    beans.beanType,
-	}
+	}, nil
 }
 
 func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
@@ -215,11 +267,12 @@ func main() {
 	//
 	// Some of the struct types and their functions need to be filled in properly. It may be helpful to finish the
 	// Grinder impl, and then Brewer impl each, and then see how things all fit together inside CoffeeShop afterwards.
-	numCustomers := 5
+	numCustomers := 10
 	var wg sync.WaitGroup
 	wg.Add(numCustomers)
 
 	//b := Beans{weightGrams: 10}
+	beanFill := 200
 	g1 := &Grinder{gramsPerSecond: 5}
 	g2 := &Grinder{gramsPerSecond: 3}
 	g3 := &Grinder{gramsPerSecond: 12}
@@ -227,8 +280,25 @@ func main() {
 	b1 := &Brewer{ouncesWaterPerSecond: 10}
 	b2 := &Brewer{ouncesWaterPerSecond: 5}
 
-	cs := NewCoffeeShop([]*Grinder{g1, g2, g3}, []*Brewer{b1, b2}, numCustomers)
-	go cs.StartBaristas(100)
+	cs := NewCoffeeShop([]*Grinder{g1, g2, g3}, []*Brewer{b1, b2}, numCustomers, beanFill)
+	go cs.StartBaristas(2)
+
+	// listen for "refill command"
+	commandChan := make(chan string)
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			commandChan <- scanner.Text()
+		}
+	}()
+
+	go func() {
+		for cmd := range commandChan {
+			if cmd == "refill" {
+				cs.RefillBeans(beanFill)
+			}
+		}
+	}()
 
 	sizes := []CoffeeSize{Small, Medium, Large}
 	for i := 0; i < numCustomers; i++ {
