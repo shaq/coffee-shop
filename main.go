@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -33,14 +34,12 @@ type Beans struct {
 
 type Grinder struct {
 	gramsPerSecond int
-	busy           bool
 	mu             sync.Mutex
 }
 
 type Brewer struct {
 	// assume we have unlimited water, but we can only run a certain amount of water per second into our brewer + beans
 	ouncesWaterPerSecond int
-	busy                 bool
 	mu                   sync.Mutex
 }
 
@@ -59,18 +58,47 @@ var coffeeSizesToOunces = map[CoffeeSize]int{
 }
 
 type Order struct {
-	ID   int
-	size CoffeeSize
-	//ouncesOfCoffeeWanted int
-	coffeeStrength int // grams of beans per ounce of coffee. 2:1 for regular, 3:1 for strong etc.
+	ID             int
+	size           CoffeeSize // using a more general coffee size instead of `ouncesOfCoffeeWanted`
+	coffeeStrength int        // grams of beans per ounce of coffee. 2:1 for regular, 3:1 for strong etc.
 }
 
 type CoffeeShop struct {
+	grindersPool             chan *Grinder
+	brewersPool              chan *Brewer
 	grinders                 []*Grinder
 	brewers                  []*Brewer
 	totalAmountUngroundBeans int
 	orders                   chan Order
 	done                     chan Coffee
+	failedOrders             chan Order
+}
+
+func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer, numCustomers int) *CoffeeShop {
+	cs := &CoffeeShop{
+		grindersPool:             make(chan *Grinder, len(grinders)),
+		brewersPool:              make(chan *Brewer, len(brewers)),
+		grinders:                 grinders,
+		brewers:                  brewers,
+		totalAmountUngroundBeans: 100, // default amount of coffee beans
+		orders:                   make(chan Order, numCustomers),
+		done:                     make(chan Coffee, numCustomers),
+		failedOrders:             make(chan Order, numCustomers),
+	}
+
+	for _, g := range grinders {
+		cs.grindersPool <- g
+	}
+
+	for _, b := range brewers {
+		cs.brewersPool <- b
+	}
+
+	return cs
+}
+
+func (cs *CoffeeShop) MakeCoffeeOrder(order Order) {
+	cs.orders <- order
 }
 
 type Coffee struct {
@@ -94,65 +122,59 @@ func NewBarista(id int, coffeeShop *CoffeeShop) *Barista {
 func (b *Barista) ProcessOrders() {
 	for order := range b.coffeeShop.orders {
 		fmt.Printf(Format(YELLOW, fmt.Sprintf("Barista %d processing order %d\n", b.ID, order.ID)))
-		b.processOrder(order)
-		fmt.Printf(Format(GREEN, fmt.Sprintf("Order %d completed by Barista %d\n", order.ID, b.ID)))
+		err := b.processOrder(order, 0)
+		if err != nil {
+			b.coffeeShop.failedOrders <- order
+			fmt.Println(err.Error())
+		}
 	}
 }
 
-func (b *Barista) processOrder(order Order) {
+func (b *Barista) processOrder(order Order, retryCount int) error {
+	const maxRetries = 5
+	const initDelay = 3 * time.Second
+	delay := time.Duration(math.Pow(2, float64(retryCount))) * initDelay // exponential backoff strategy for timeouts
+
 	ouncesOfCoffeeWanted := coffeeSizesToOunces[order.size]
 	gramsNeeded := ouncesOfCoffeeWanted * order.coffeeStrength
-
 	ungroundBeans := Beans{weightGrams: gramsNeeded, state: Unground}
 
 	var groundBeans Beans
-	for {
-		grinderFound := false
-		for _, grinder := range b.coffeeShop.grinders {
-			grinder.mu.Lock()
-			if !grinder.busy {
-				grinder.busy = true
-				grinder.mu.Unlock()
-				groundBeans = grinder.Grind(ungroundBeans)
-				grinderFound = true
-				break
-			}
-			grinder.mu.Unlock()
-		}
-
-		if grinderFound {
-			break
+	var grinder *Grinder
+	select {
+	case grinder = <-b.coffeeShop.grindersPool:
+	case <-time.After(delay):
+		if retryCount < maxRetries {
+			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			return b.processOrder(order, retryCount+1)
 		} else {
-			err := fmt.Errorf("no available grinder for order %d, retrying ...", order.ID)
-			fmt.Println(Format(RED, err.Error()))
-			time.Sleep(500 * time.Millisecond)
+			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts", b.ID, order.ID, retryCount)))
 		}
 	}
+	retryCount = 0 // reset retryCount for Brewer
 
-	for {
-		brewerFound := false
-		for _, brewer := range b.coffeeShop.brewers {
-			brewer.mu.Lock()
-			if !brewer.busy {
-				brewer.busy = true
-				brewer.mu.Unlock()
-				groundBeans.state = Brewed
-				b.coffeeShop.done <- brewer.Brew(groundBeans, order.size, order.ID)
-				brewerFound = true
-				break
-			}
-			brewer.mu.Unlock()
-		}
+	groundBeans = grinder.Grind(ungroundBeans)
+	b.coffeeShop.grindersPool <- grinder
+	groundBeans.state = Ground
 
-		if brewerFound {
-			break
+	var coffee Coffee
+	var brewer *Brewer
+	select {
+	case brewer = <-b.coffeeShop.brewersPool:
+	case <-time.After(delay):
+		if retryCount < maxRetries {
+			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+			return b.processOrder(order, retryCount+1)
 		} else {
-			err := fmt.Errorf("no available brewer for order %d, retrying ...", order.ID)
-			fmt.Println(Format(RED, err.Error()))
-			time.Sleep(500 * time.Millisecond)
+			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts", b.ID, order.ID, retryCount)))
 		}
 	}
+	coffee = brewer.Brew(groundBeans, order.size, order.ID)
+	b.coffeeShop.brewersPool <- brewer
+	groundBeans.state = Brewed
 
+	b.coffeeShop.done <- coffee
+	return nil
 }
 
 func (cs *CoffeeShop) StartBaristas(numBaristas int) {
@@ -167,9 +189,6 @@ func (g *Grinder) Grind(beans Beans) Beans {
 	// i.e. time.Sleep(XXX)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-
-	g.busy = true
-	defer func() { g.busy = false }()
 
 	grindTime := beans.weightGrams / g.gramsPerSecond
 	time.Sleep(time.Duration(grindTime) * time.Second)
@@ -187,9 +206,6 @@ func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.busy = true
-	defer func() { b.busy = false }()
-
 	brewTime := (beans.weightGrams / 2) * 1 / b.ouncesWaterPerSecond
 	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v\n", time.Duration(brewTime)*time.Second, orderID, size)))
 	time.Sleep(time.Duration(brewTime) * time.Second)
@@ -197,20 +213,6 @@ func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
 		orderID,
 		size,
 	}
-}
-
-func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer) *CoffeeShop {
-	return &CoffeeShop{
-		grinders:                 grinders,
-		brewers:                  brewers,
-		totalAmountUngroundBeans: 100, // default amount of coffee beans
-		orders:                   make(chan Order, 10),
-		done:                     make(chan Coffee, 10),
-	}
-}
-
-func (cs *CoffeeShop) MakeCoffeeOrder(order Order) {
-	cs.orders <- order
 }
 
 func main() {
@@ -221,7 +223,7 @@ func main() {
 	//
 	// Some of the struct types and their functions need to be filled in properly. It may be helpful to finish the
 	// Grinder impl, and then Brewer impl each, and then see how things all fit together inside CoffeeShop afterwards.
-	numCustomers := 10
+	numCustomers := 5
 	var wg sync.WaitGroup
 	wg.Add(numCustomers)
 
@@ -230,12 +232,11 @@ func main() {
 	g2 := &Grinder{gramsPerSecond: 3}
 	g3 := &Grinder{gramsPerSecond: 12}
 
-	b1 := &Brewer{ouncesWaterPerSecond: 2}
+	b1 := &Brewer{ouncesWaterPerSecond: 10}
 	b2 := &Brewer{ouncesWaterPerSecond: 5}
 
-	cs := NewCoffeeShop([]*Grinder{g1, g2, g3}, []*Brewer{b1, b2})
-
-	go cs.StartBaristas(5)
+	cs := NewCoffeeShop([]*Grinder{g1, g2, g3}, []*Brewer{b1, b2}, numCustomers)
+	go cs.StartBaristas(100)
 
 	sizes := []CoffeeSize{Small, Medium, Large}
 	for i := 0; i < numCustomers; i++ {
@@ -252,18 +253,23 @@ func main() {
 				},
 			)
 			fmt.Printf("Customer %d served %v \n", i, size)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond) // slight delay between creating each order
 		}()
 	}
 	wg.Wait()
-
 	close(cs.orders)
 
 	// Wait for all coffees to be done
 	for i := 0; i < numCustomers; i++ {
-		<-cs.done
+		c := <-cs.done
+		fmt.Printf(Format(GREEN, fmt.Sprintf("Order %d completed\n", c.OrderID)))
 	}
 	close(cs.done)
+
+	for j := 0; j < len(cs.failedOrders); j++ {
+		<-cs.failedOrders
+	}
+	close(cs.failedOrders)
 
 	// Issues with the above
 	// 1. Assumes that we have unlimited amounts of grinders and brewers.
