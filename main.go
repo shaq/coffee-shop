@@ -42,9 +42,30 @@ type Grinder struct {
 	gramsPerSecond int
 }
 
+func (g *Grinder) Grind(beans Beans) Beans {
+	grindTime := beans.weightGrams / g.gramsPerSecond
+	time.Sleep(time.Duration(grindTime) * time.Second)
+	return Beans{
+		weightGrams: beans.weightGrams,
+		state:       Ground,
+		beanType:    beans.beanType,
+	}
+}
+
 type Brewer struct {
 	// assume we have unlimited water, but we can only run a certain amount of water per second into our brewer + beans
 	ouncesWaterPerSecond int
+}
+
+func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
+	// assume we need 6 ounces of water for every 12 grams of beans
+	brewTime := (beans.weightGrams / 2) * 1 / b.ouncesWaterPerSecond
+	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v with %v beans\n", time.Duration(brewTime)*time.Second, orderID, size, beans.beanType)))
+	time.Sleep(time.Duration(brewTime) * time.Second)
+	return Coffee{
+		orderID,
+		size,
+	}
 }
 
 type CoffeeSize int
@@ -67,11 +88,15 @@ type Order struct {
 	coffeeStrength int        // grams of beans per ounce of coffee. 2:1 for regular, 3:1 for strong etc.
 }
 
+type Coffee struct {
+	// should hold size maybe?
+	OrderID int
+	size    CoffeeSize
+}
+
 type CoffeeShop struct {
 	grindersPool             chan *Grinder
 	brewersPool              chan *Brewer
-	grinders                 []*Grinder
-	brewers                  []*Brewer
 	totalAmountUngroundBeans int
 	beansMutex               sync.Mutex
 	orders                   chan Order
@@ -83,8 +108,6 @@ func NewCoffeeShop(grinders []*Grinder, brewers []*Brewer, numCustomers int, ung
 	cs := &CoffeeShop{
 		grindersPool:             make(chan *Grinder, len(grinders)),
 		brewersPool:              make(chan *Brewer, len(brewers)),
-		grinders:                 grinders,
-		brewers:                  brewers,
 		totalAmountUngroundBeans: ungroundBeans,
 		orders:                   make(chan Order, numCustomers),
 		done:                     make(chan Coffee, numCustomers),
@@ -116,10 +139,11 @@ func (cs *CoffeeShop) RefillBeans(amount int) {
 	cs.refills <- struct{}{} // signal that a refill has occurred
 }
 
-type Coffee struct {
-	// should hold size maybe?
-	OrderID int
-	size    CoffeeSize
+func (cs *CoffeeShop) StartBaristas(numBaristas int) {
+	for i := 1; i <= numBaristas; i++ {
+		barista := NewBarista(i, cs)
+		go barista.ProcessOrders()
+	}
 }
 
 type Barista struct {
@@ -134,6 +158,24 @@ func NewBarista(id int, coffeeShop *CoffeeShop) *Barista {
 	}
 }
 
+func (b *Barista) UseBeans(amount int) bool {
+	b.coffeeShop.beansMutex.Lock()
+	defer b.coffeeShop.beansMutex.Unlock()
+
+	if b.coffeeShop.totalAmountUngroundBeans < amount {
+		return false
+	}
+
+	b.coffeeShop.totalAmountUngroundBeans -= amount
+	return true
+}
+
+func (b *Barista) ReturnBeans(amount int) {
+	b.coffeeShop.beansMutex.Lock()
+	b.coffeeShop.totalAmountUngroundBeans += amount
+	b.coffeeShop.beansMutex.Unlock()
+}
+
 func (b *Barista) ProcessOrders() {
 	for order := range b.coffeeShop.orders {
 		fmt.Printf(Format(YELLOW, fmt.Sprintf("Barista %d processing order %d\n", b.ID, order.ID)))
@@ -144,6 +186,7 @@ func (b *Barista) ProcessOrders() {
 	}
 }
 
+// chose not to make this function DRY to increase readability of complex control flow
 func (b *Barista) processOrder(order Order, retryCount int) error {
 	const maxRetries = 5
 	const initDelay = 500 * time.Millisecond
@@ -155,17 +198,18 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 	gramsNeeded := ouncesOfCoffeeWanted * order.coffeeStrength
 	ungroundBeans := Beans{weightGrams: gramsNeeded, state: Unground}
 
-	// first check if there are enough beans to process the order
-	if !b.coffeeShop.UseBeans(gramsNeeded) {
+	// Barista first checks if there are enough beans to process the order
+	if !b.UseBeans(gramsNeeded) {
 		// retry if not
 		if retryCount < maxRetries {
-			fmt.Printf(Format(RED, "Problem grinding beans ... "))
+			fmt.Printf(Format(RED, fmt.Sprintf("Not enough beans for order %v: %v with %v beans\n", order.ID, order.size, ungroundBeans.beanType)))
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			time.Sleep(delay)
 			return b.processOrder(order, retryCount+1)
 		} else {
-			// if retries fail, still mark order as processed
-			markOrderProcessed()
+			// if after `maxRetries` attempts there are still not enough beans, return beans and mark order as processed
+			b.ReturnBeans(gramsNeeded)
+			b.markOrderProcessed()
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: not enough beans.", b.ID, order.ID, retryCount)))
 		}
 	}
@@ -183,7 +227,9 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			return b.processOrder(order, retryCount+1)
 		} else {
-			markOrderProcessed()
+			// if after `maxRetries` attempts there is still no grinders available, return beans and mark order as processed
+			b.ReturnBeans(gramsNeeded)
+			b.markOrderProcessed()
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: grinder error.", b.ID, order.ID, retryCount)))
 		}
 	case <-b.coffeeShop.refills:
@@ -205,58 +251,20 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Brew: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			return b.processOrder(order, retryCount+1)
 		} else {
-			markOrderProcessed()
+			// if after `maxRetries` attempts there is still no grinders available, just mark order as processed.
+			// (can't return beans that have been ground)
+			b.markOrderProcessed()
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: brewer error.", b.ID, order.ID, retryCount)))
 		}
 	}
 
 	b.coffeeShop.done <- coffee
-	markOrderProcessed()
+	b.markOrderProcessed()
 	return nil
 }
 
-func markOrderProcessed() {
+func (b *Barista) markOrderProcessed() {
 	completedOrdersWG.Done()
-}
-
-func (cs *CoffeeShop) StartBaristas(numBaristas int) {
-	for i := 1; i <= numBaristas; i++ {
-		barista := NewBarista(i, cs)
-		go barista.ProcessOrders()
-	}
-}
-
-func (cs *CoffeeShop) UseBeans(amount int) bool {
-	cs.beansMutex.Lock()
-	defer cs.beansMutex.Unlock()
-
-	if cs.totalAmountUngroundBeans < amount {
-		return false
-	}
-
-	cs.totalAmountUngroundBeans -= amount
-	return true
-}
-
-func (g *Grinder) Grind(beans Beans) Beans {
-	grindTime := beans.weightGrams / g.gramsPerSecond
-	time.Sleep(time.Duration(grindTime) * time.Second)
-	return Beans{
-		weightGrams: beans.weightGrams,
-		state:       Ground,
-		beanType:    beans.beanType,
-	}
-}
-
-func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
-	// assume we need 6 ounces of water for every 12 grams of beans
-	brewTime := (beans.weightGrams / 2) * 1 / b.ouncesWaterPerSecond
-	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v with %v beans\n", time.Duration(brewTime)*time.Second, orderID, size, beans.beanType)))
-	time.Sleep(time.Duration(brewTime) * time.Second)
-	return Coffee{
-		orderID,
-		size,
-	}
 }
 
 func main() {
