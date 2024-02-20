@@ -227,7 +227,7 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			return b.processOrder(order, retryCount+1)
 		} else {
-			// if after `maxRetries` attempts there is still no grinders available, return beans and mark order as processed
+			// if after `maxRetries` attempts there are still no grinders available, return beans and mark order as processed
 			b.ReturnBeans(gramsNeeded)
 			b.markOrderProcessed()
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: grinder error.", b.ID, order.ID, retryCount)))
@@ -251,8 +251,8 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Brew: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			return b.processOrder(order, retryCount+1)
 		} else {
-			// if after `maxRetries` attempts there is still no grinders available, just mark order as processed.
-			// (can't return beans that have been ground)
+			// if after `maxRetries` attempts there are still no brewers available, just mark order as processed.
+			// (can't return beans that have already been ground)
 			b.markOrderProcessed()
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: brewer error.", b.ID, order.ID, retryCount)))
 		}
