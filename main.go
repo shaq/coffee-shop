@@ -188,7 +188,7 @@ func (b *Barista) ReturnBeans(amount int) {
 func (b *Barista) ProcessOrders() {
 	for order := range b.coffeeShop.orders {
 		fmt.Printf(Format(YELLOW, fmt.Sprintf("Barista %d processing order %d\n", b.ID, order.ID)))
-		err := b.processOrder(order, 0)
+		err := b.processOrder(order, 0, Beans{})
 		if err != nil {
 			fmt.Println(err.Error())
 		}
@@ -196,7 +196,7 @@ func (b *Barista) ProcessOrders() {
 }
 
 // chose not to make this function DRY to increase readability of complex control flow
-func (b *Barista) processOrder(order Order, retryCount int) error {
+func (b *Barista) processOrder(order Order, retryCount int, beans Beans) error {
 	const maxRetries = 5
 	const initDelay = 500 * time.Millisecond
 	// exponential backoff for retries
@@ -205,16 +205,18 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 	// calculate the amount of beans needed to make the order
 	ouncesOfCoffeeWanted := coffeeSizesToOunces[order.size]
 	gramsNeeded := ouncesOfCoffeeWanted * order.coffeeStrength
-	ungroundBeans := Beans{weightGrams: gramsNeeded, state: Unground}
+	if beans == (Beans{}) {
+		beans = Beans{weightGrams: gramsNeeded, state: Unground}
+	}
 
 	// Barista first checks if there are enough beans to process the order
 	if !b.UseBeans(gramsNeeded) {
 		// retry if not
 		if retryCount < maxRetries {
-			fmt.Printf(Format(RED, fmt.Sprintf("Not enough beans for order %v: %v with %v beans\n", order.ID, order.size, ungroundBeans.beanType)))
+			fmt.Printf(Format(RED, fmt.Sprintf("Not enough beans for order %v: %v with %v beans\n", order.ID, order.size, beans.beanType)))
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
 			time.Sleep(delay)
-			return b.processOrder(order, retryCount+1)
+			return b.processOrder(order, retryCount+1, Beans{})
 		} else {
 			// if after `maxRetries` attempts there are still not enough beans, mark order as processed
 			b.markOrderProcessed(Coffee{
@@ -225,20 +227,21 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 		}
 	}
 
-	var groundBeans Beans
+	//var groundBeans Beans
 	var grinder *Grinder
 	// only attempt to grind beans if we haven't successfully before
-	if groundBeans == (Beans{}) {
+	if beans.state != Ground {
 		select {
 		// try to acquire grinder from pool
 		case grinder = <-b.coffeeShop.grindersPool:
-			groundBeans = grinder.Grind(ungroundBeans)
+			beans = grinder.Grind(beans)
+			beans.state = Ground
 			b.coffeeShop.grindersPool <- grinder
-			groundBeans.state = Ground
 		case <-time.After(delay):
 			if retryCount < maxRetries {
+				b.ReturnBeans(gramsNeeded)
 				fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
-				return b.processOrder(order, retryCount+1)
+				return b.processOrder(order, retryCount+1, Beans{})
 			} else {
 				// if after `maxRetries` attempts there are still no grinders available, return beans and mark order as processed
 				b.ReturnBeans(gramsNeeded)
@@ -250,25 +253,25 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			}
 		case <-b.coffeeShop.refills:
 			// if beans are refilled, try the order again and reset retries
-			return b.processOrder(order, 0)
+			return b.processOrder(order, 0, Beans{})
 		}
+		// reset retries for brewing
+		retryCount = 0
 	}
-	// reset retries for brewing
-	retryCount = 0
 
 	var coffee Coffee
 	var brewer *Brewer
 	select {
 	case brewer = <-b.coffeeShop.brewersPool:
-		coffee = brewer.Brew(groundBeans, order.size, order.ID)
+		coffee = brewer.Brew(beans, order.size, order.ID)
+		beans.state = Brewed
 		b.coffeeShop.brewersPool <- brewer
-		groundBeans.state = Brewed
 		b.markOrderProcessed(coffee)
 		return nil
 	case <-time.After(delay):
 		if retryCount < maxRetries {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Brew: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
-			return b.processOrder(order, retryCount+1)
+			return b.processOrder(order, retryCount+1, beans)
 		} else {
 			// if after `maxRetries` attempts there are still no brewers available, just mark order as processed.
 			// (can't return beans that have already been ground)
