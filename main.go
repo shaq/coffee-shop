@@ -63,8 +63,9 @@ func (b *Brewer) Brew(beans Beans, size CoffeeSize, orderID int) Coffee {
 	fmt.Printf(Format(PURPLE, fmt.Sprintf("Waiting %v seconds to brew order %v: %v with %v beans\n", time.Duration(brewTime)*time.Second, orderID, size, beans.beanType)))
 	time.Sleep(time.Duration(brewTime) * time.Second)
 	return Coffee{
-		orderID,
-		size,
+		orderID: orderID,
+		size:    size,
+		status:  Success,
 	}
 }
 
@@ -88,10 +89,18 @@ type Order struct {
 	coffeeStrength int        // grams of beans per ounce of coffee. 2:1 for regular, 3:1 for strong etc.
 }
 
+type CoffeeStatus int
+
+const (
+	Success CoffeeStatus = iota
+	Failure
+)
+
 type Coffee struct {
 	// should hold size maybe?
-	OrderID int
+	orderID int
 	size    CoffeeSize
+	status  CoffeeStatus
 }
 
 type CoffeeShop struct {
@@ -207,9 +216,11 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 			time.Sleep(delay)
 			return b.processOrder(order, retryCount+1)
 		} else {
-			// if after `maxRetries` attempts there are still not enough beans, return beans and mark order as processed
-			b.ReturnBeans(gramsNeeded)
-			b.markOrderProcessed()
+			// if after `maxRetries` attempts there are still not enough beans, mark order as processed
+			b.markOrderProcessed(Coffee{
+				orderID: order.ID,
+				status:  Failure,
+			})
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: not enough beans.", b.ID, order.ID, retryCount)))
 		}
 	}
@@ -229,7 +240,10 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 		} else {
 			// if after `maxRetries` attempts there are still no grinders available, return beans and mark order as processed
 			b.ReturnBeans(gramsNeeded)
-			b.markOrderProcessed()
+			b.markOrderProcessed(Coffee{
+				orderID: order.ID,
+				status:  Failure,
+			})
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: grinder error.", b.ID, order.ID, retryCount)))
 		}
 	case <-b.coffeeShop.refills:
@@ -246,6 +260,8 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 		coffee = brewer.Brew(groundBeans, order.size, order.ID)
 		b.coffeeShop.brewersPool <- brewer
 		groundBeans.state = Brewed
+		b.markOrderProcessed(coffee)
+		return nil
 	case <-time.After(delay):
 		if retryCount < maxRetries {
 			fmt.Printf(Format(BLUE, fmt.Sprintf("Brew: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
@@ -253,17 +269,17 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 		} else {
 			// if after `maxRetries` attempts there are still no brewers available, just mark order as processed.
 			// (can't return beans that have already been ground)
-			b.markOrderProcessed()
+			b.markOrderProcessed(Coffee{
+				orderID: order.ID,
+				status:  Failure,
+			})
 			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: brewer error.", b.ID, order.ID, retryCount)))
 		}
 	}
-
-	b.coffeeShop.done <- coffee
-	b.markOrderProcessed()
-	return nil
 }
 
-func (b *Barista) markOrderProcessed() {
+func (b *Barista) markOrderProcessed(coffee Coffee) {
+	b.coffeeShop.done <- coffee
 	completedOrdersWG.Done()
 }
 
@@ -272,7 +288,7 @@ func main() {
 	newOrdersWG.Add(numCustomers)
 	completedOrdersWG.Add(numCustomers)
 
-	beanFill := 500
+	beanFill := 50
 	g1 := &Grinder{gramsPerSecond: 5}
 	g2 := &Grinder{gramsPerSecond: 3}
 	g3 := &Grinder{gramsPerSecond: 12}
@@ -329,6 +345,8 @@ func main() {
 
 	// simultaneously read from done channel
 	for coffee := range cs.done {
-		fmt.Printf(Format(GREEN, fmt.Sprintf("Order %d completed\n", coffee.OrderID)))
+		if coffee.status == Success {
+			fmt.Printf(Format(GREEN, fmt.Sprintf("Order %d completed successfully! %v\n", coffee.orderID, coffee.size)))
+		}
 	}
 }
