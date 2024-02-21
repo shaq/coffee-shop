@@ -227,28 +227,31 @@ func (b *Barista) processOrder(order Order, retryCount int) error {
 
 	var groundBeans Beans
 	var grinder *Grinder
-	select {
-	// try to acquire grinder from pool
-	case grinder = <-b.coffeeShop.grindersPool:
-		groundBeans = grinder.Grind(ungroundBeans)
-		b.coffeeShop.grindersPool <- grinder
-		groundBeans.state = Ground
-	case <-time.After(delay):
-		if retryCount < maxRetries {
-			fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
-			return b.processOrder(order, retryCount+1)
-		} else {
-			// if after `maxRetries` attempts there are still no grinders available, return beans and mark order as processed
-			b.ReturnBeans(gramsNeeded)
-			b.markOrderProcessed(Coffee{
-				orderID: order.ID,
-				status:  Failure,
-			})
-			return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: grinder error.", b.ID, order.ID, retryCount)))
+	// only attempt to grind beans if we haven't successfully before
+	if groundBeans == (Beans{}) {
+		select {
+		// try to acquire grinder from pool
+		case grinder = <-b.coffeeShop.grindersPool:
+			groundBeans = grinder.Grind(ungroundBeans)
+			b.coffeeShop.grindersPool <- grinder
+			groundBeans.state = Ground
+		case <-time.After(delay):
+			if retryCount < maxRetries {
+				fmt.Printf(Format(BLUE, fmt.Sprintf("Grind: Barista %v retrying order %v, attempt %v\n", b.ID, order.ID, retryCount+1)))
+				return b.processOrder(order, retryCount+1)
+			} else {
+				// if after `maxRetries` attempts there are still no grinders available, return beans and mark order as processed
+				b.ReturnBeans(gramsNeeded)
+				b.markOrderProcessed(Coffee{
+					orderID: order.ID,
+					status:  Failure,
+				})
+				return fmt.Errorf(Format(RED, fmt.Sprintf("Barista %v failed to process order %v after %v attempts: grinder error.", b.ID, order.ID, retryCount)))
+			}
+		case <-b.coffeeShop.refills:
+			// if beans are refilled, try the order again and reset retries
+			return b.processOrder(order, 0)
 		}
-	case <-b.coffeeShop.refills:
-		// if beans are refilled, try the order again and reset retries
-		return b.processOrder(order, 0)
 	}
 	// reset retries for brewing
 	retryCount = 0
@@ -288,7 +291,7 @@ func main() {
 	newOrdersWG.Add(numCustomers)
 	completedOrdersWG.Add(numCustomers)
 
-	beanFill := 50
+	beanFill := 500
 	g1 := &Grinder{gramsPerSecond: 5}
 	g2 := &Grinder{gramsPerSecond: 3}
 	g3 := &Grinder{gramsPerSecond: 12}
